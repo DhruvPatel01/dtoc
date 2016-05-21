@@ -7,6 +7,7 @@ import string
 import math
 import logging
 import sys
+import time
 
 import dtoc_bencode
 import dtoc_exceptions
@@ -105,6 +106,7 @@ class Torrent(object):
     def start(self):
         if self.status == 'started': return
         if self.verbose > 15: print(self.name, "Staring...")
+        self.started_at = time.time()
         self.downloaded_session = 0
         self.uploaded_session = 0
         self._client_factory = PeerProtocol.BTClientFactory(self)
@@ -213,7 +215,9 @@ class Torrent(object):
     def progress_printer(self):
         p  = self.progress()
         barlength = math.floor(p*BAR_LENGTH)
-        s = '%s [%s%s] %6.2f%%' % (self.name, '#'*barlength, ' '*(BAR_LENGTH-barlength), p*100)
+        ctime = time.time()
+        speed = (self.downloaded_session/1024) / (ctime - self.started_at)
+        s = '%s [%s%s] %6.2f%% %.2f KB/s' % (self.name, '#'*barlength, ' '*(BAR_LENGTH-barlength), p*100, speed)
         print('\b'*len(s), end='')
         print(s, end='')
         sys.stdout.flush()
@@ -236,6 +240,7 @@ class Torrent(object):
         if not self.bitfield[index]:
             self.bitfield[index] = True
             self.downloaded += self.length_of_piece(index)
+            self.downloaded_session += self.length_of_piece(index)
         for q in self.queue:
             if index in q: q.remove(index)
         return True

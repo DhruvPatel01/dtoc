@@ -42,7 +42,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     if args.progress:
-        torrent.progress_printer()
+        reactor.callLater(2, torrent.progress_printer)
     if args.http:
         json_list = json.load(args.http)
         if len(json_list) != len(torrent.files):
