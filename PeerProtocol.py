@@ -5,6 +5,8 @@ import bitarray
 from enum import Enum
 import logging
 
+import dtoc_bencode
+
 REQUEST_PIECE_SIZE = 0X4000
 
 class BTProtocolStates(Enum):
@@ -12,13 +14,15 @@ class BTProtocolStates(Enum):
     connected = 2
 
 class BTClientFactory(ClientFactory):
-    def __init__(self, torrent):
+    def __init__(self, torrent, lndp=False):
         self.torrent = torrent
+        self._lndp = lndp
 
     def buildProtocol(self, addr):
         p = BTProtocol(self.torrent)
         p.addr = addr
         p.type = 0 #outgoing
+        p._is_lndp = self._lndp
         return p
 
     def clientConnectionFailed(self, connector, reason):
@@ -57,7 +61,8 @@ class BTProtocol(Protocol):
         self.peer_interested = False
         self.peer_bitfield = set()
         self.state = None
-        self.type = None #incoming:0 or outgoing:1 set by factory
+        self.type = None #incoming:1 or outgoing:0 set by factory
+        self.downloaded = 0 #reset every 2 seconds for mor accurate speed
 
     def connectionMade(self):
         self._send_handshake()
@@ -69,6 +74,7 @@ class BTProtocol(Protocol):
         logging.warn("Connection lost with %s"%self.addr)
 
     def dataReceived(self, data):
+        self.downloaded += len(data)
         self._buffer_msg += data
         while True:
             if self.state == BTProtocolStates.connected:
@@ -94,6 +100,7 @@ class BTProtocol(Protocol):
         if index is None or index < 0 or index >= len(self._torrent.pieces):
             index = self._torrent.give_me_order(self.peer_bitfield)
         if index is None:
+            self._currently_downloading_block = None
             return
         target_piece_size = self._torrent.length_of_piece(index)
         offset = 0
@@ -103,7 +110,7 @@ class BTProtocol(Protocol):
 
     def _send_handshake(self):
         reserved = bytearray(b'\x00'*8)
-        # reserved[5] |= 0x10
+        reserved[5] |= 0x10
         self.transport.write(b'\x13BitTorrent protocol')
         self.transport.write(reserved)
         self.transport.write(self._torrent.info_hash)
@@ -113,14 +120,15 @@ class BTProtocol(Protocol):
     def _handle_handshake(self, packet):
         """Assume packet is valid"""
         if packet[28:48] != self._torrent.info_hash:
+            logging.debug("Wrong infohash. losing connection.")
             self.transport.loseConnection()
             return
-        # if packet[25] & 0x10:
-        #     self._send_ltep_handshake()
         self.peer_id = packet[48:68] #self.peer_id is his peer id, self._torrent.peer_id is ours
         if self.peer_id == self._torrent.peer_id:
             self.transport.loseConnection()
             return
+        if (packet[25] & 0x10) and self.type == 0:
+            self._send_ltep_handshake()
         self.state = BTProtocolStates.connected
         self._send_bitfield()
         self._send_intereseted()
@@ -148,15 +156,19 @@ class BTProtocol(Protocol):
         self.transport.write(b'\x00\x00\x00\x00')
 
     def _send_choke(self):
+        self.am_choking = True
         self.transport.write(b'\x00\x00\x00\x01\x00')
 
     def _send_unchoke(self):
+        self.am_choking = False
         self.transport.write(b'\x00\x00\x00\x01\x01')
 
     def _send_intereseted(self):
+        self.am_ineterested = True
         self.transport.write(b'\x00\x00\x00\x01\x02')
 
     def _send_not_interested(self):
+        self.am_ineterested = False
         self.transport.write(b'\x00\x00\x00\x01\x03')
 
     def _send_have(self, index):
@@ -186,6 +198,7 @@ class BTProtocol(Protocol):
 
     def _handle_interested(self, payload=None):
         self.peer_interested = True
+        if self.am_choking: self._send_unchoke()
 
     def _handle_not_ineteresetd(self, payload=None):
         self.peer_interested = False
@@ -193,6 +206,8 @@ class BTProtocol(Protocol):
     def _handle_have(self, payload):
         b = struct.unpack('>I', payload)
         self.peer_bitfield.add(b[0])
+        if self._currently_downloading_block is None:
+            self.do_download()
 
     def _handle_bitfield(self, payload):
         ba = bitarray.bitarray(endian="big")
@@ -212,6 +227,7 @@ class BTProtocol(Protocol):
         if self._current_index != index:
             self._current_piece = self._torrent.read_piece(index)
             self._current_index = index
+        self.transport.write(struct.pack('>IBII', 9+length, 7, index, begin))
         self.transport.write(self._current_piece[begin:begin+length])
 
     def _handle_piece(self, payload):
@@ -227,10 +243,10 @@ class BTProtocol(Protocol):
             length = min(REQUEST_PIECE_SIZE, target_piece_size - offset)
             self._send_request(nr, offset, length)
         elif self._torrent.write_piece(self._currently_downloading_block, self._buffer_piece):
-            logging.info("Successfully downloaded picece no %d"%index)
             self._buffer_piece = b''
             for protocol in self._torrent.current_protocols:
                 protocol._send_have(index)
+            logging.info("\nDownloaded %d from %s" % (self._currently_downloading_block, self.transport.getPeer()))
             self.do_download()
         else:
             self._buffer_piece = b''
@@ -241,29 +257,35 @@ class BTProtocol(Protocol):
         if payload[0] == 0:
             self._handle_ltep_handshake(payload[1:])
         if payload[0] == 1:
-            self.lndp.handle(payload)
+            self._torrent.lndp.handle(payload[1:], self)
+            # print("Received LTEP msg")
 
     def _send_ltep_handshake(self):
-        #msg = {'m':{'dt_lndp': 1}}
-        msg = b'd1:md7:dt_lndpi1eee'
-        self._send_ltep(0, msg)
+        if self.type == 0 and not self._is_lndp:
+            msg_d = {'m': {}}
+        else:
+            msg_d = {'m':{'dt_lndp': 1}}
+        msg = dtoc_bencode.bencode(msg_d)
+        self.transport.write(struct.pack('>I', len(msg)+2))
+        self.transport.write(b'\x14\x00')
+        self.transport.write(msg)
 
-    def _send_ltep(self, msg_protocol, payload):
+    def send_ltep(self, msg_protocol, payload):
         msg_id = self.peer_ltep.get(msg_protocol, -1)
-        if msg_id == -1:
-            raise("No support for ltep")
+        if msg_id == -1: raise Exception("No support for ltep %s"%msg_protocol)
         self.transport.write(struct.pack('>I', len(payload)+2))
-        self.transport.write(0x14)
-        self.transport.write(msg_id)
+        self.transport.write(b'\x14')
+        self.transport.write(struct.pack('>B', msg_id))
         self.transport.write(payload)
 
     def _handle_ltep_handshake(self, msg):
+        if self.type == 1: self._send_ltep_handshake()
         msg = dtoc_bencode.bdecode(msg)
-        self.peer_ltep = {k:int(v) for k,v in msg[b'm']}
-        print(self.peer_ltep)
-        input()
+        self.peer_ltep = {k.decode('utf-8'):int(v) for k,v in msg[b'm'].items()}
+        if self.type == 1 and 'dt_lndp' in self.peer_ltep:
+            self._torrent.lndp.send_handshake(self)
 
     def _handle_invalid(self, payload=None):
-        if (self.torrent.verbose > 10):
-            print(self.torrent.name, "Invalid packet. Losing conneciton")
+        if (self._torrent.verbose > 10):
+            print(self._torrent.name, "Invalid packet. Losing conneciton")
         self.transport.loseConnection()

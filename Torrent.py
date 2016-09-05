@@ -17,7 +17,7 @@ import PeerProtocol
 import LNDP
 
 MAX_CONNECTONS = 1
-BAR_LENGTH = 50
+BAR_LENGTH = 30
 
 class Torrent(object):
     def __init__(self, path, save_path="./", name=None, port = 6891, verbose=1):
@@ -101,8 +101,6 @@ class Torrent(object):
         self.queue[3] = set(i for i in range(len(self.pieces)))
         self.force_recheck()
 
-        self.lndp = LNDP.LNDPProtocol(self)
-
     def start(self):
         if self.status == 'started': return
         if self.verbose > 15: print(self.name, "Staring...")
@@ -117,6 +115,7 @@ class Torrent(object):
         for url in self.announce_list:
             if url.startswith('udp://'):
                 self.trackers.append(Tracker.UDPTracker(self, url, self.verbose))
+        self.lndp = LNDP.LNDPProtocol(self)
 
     def peer_list_update(self, ips):
         if (self.verbose > 15): print("Peer list updated")
@@ -213,15 +212,23 @@ class Torrent(object):
         return self.downloaded/self.size
 
     def progress_printer(self):
-        p  = self.progress()
-        barlength = math.floor(p*BAR_LENGTH)
+        prog  = self.progress()
+        barlength = math.floor(prog*BAR_LENGTH)
         ctime = time.time()
+        downloaded = 0
+        for p in self.current_protocols:
+            downloaded += p.downloaded
+            p.downloaded = 0
         speed = (self.downloaded_session/1024) / (ctime - self.started_at)
-        s = '%s [%s%s] %6.2f%% %.2f KB/s' % (self.name, '#'*barlength, ' '*(BAR_LENGTH-barlength), p*100, speed)
+        unit = 'KBps'
+        if speed > 1000:
+            speed /= 1024
+            unit= 'MBps'
+        s = '%s [%s%s] %6.2f%% %.2f %s' % (self.name, '#'*barlength, ' '*(BAR_LENGTH-barlength), prog*100, speed, unit)
         print('\b'*len(s), end='')
         print(s, end='')
         sys.stdout.flush()
-        if p < 1.0:
+        if prog < 1.0:
             reactor.callLater(2, self.progress_printer)
 
     def write_piece(self, index, piece):
@@ -250,4 +257,5 @@ class Torrent(object):
         if self.pieces[index] != self.pieces[-1]:
             return self.piece_length
         else:
-            return self.size % self.piece_length
+            lop =  self.size % self.piece_length
+            return self.piece_length if lop == 0 else lop
